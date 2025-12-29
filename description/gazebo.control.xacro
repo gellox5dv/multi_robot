@@ -8,7 +8,7 @@
             <left_joint>rear_left_wheel_joint</left_joint>
             <right_joint>rear_right_wheel_joint</right_joint>
             <wheel_separation>0.35</wheel_separation>
-            <wheel_diameter>0.1</wheel_diameter>
+            <wheel_diameter>0.2</wheel_diameter>
 
 
         <!-- Limtis-->
