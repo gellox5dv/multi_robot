@@ -13,6 +13,15 @@ def yaw_from_quat(q) -> float:
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
+def wrap_to_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(x, hi))
 
 class NashController(Node):
     """
@@ -37,24 +46,30 @@ class NashController(Node):
         self.pub_r1 = self.create_publisher(Twist, "/r1/cmd_vel", 10)
         self.pub_r2 = self.create_publisher(Twist, "/r2/cmd_vel", 10)
 
+        # steering controller (simple P controller)
+        self.k_yaw = 1.5                # steering gain
+        self.max_w = 1.2                # max angular speed
+        self.turn_in_place_yaw = 0.9    # if heading error 
+
         # ---- Tune these ----
         self.tick_hz = 5.0
-        self.v_push = 0.5
+        self.v_push  = 0.5
         self.v_yield = 0.0
 
         # Goals (meters). Change to match your world.
-        self.r1_goal = (5.0, 0.0)
+        self.r1_goal = (-2.0, -5.0)
         self.r2_goal = (-5.0, 0.0)
 
         # Safety distances
-        self.safe_dist = 1.2     # start caring
+        self.safe_dist = 0.9     # start caring
         self.collision_dist = 0.7  # heavy penalty
 
         # Payoff weights
-        self.w_progress = 2.0     # reward for moving toward goal
+        self.w_progress  = 2.0     # reward for moving toward goal
         self.w_yield_pen = 0.2    # small penalty for yielding (time loss)
         self.w_collision = 6.0    # penalty scale if close
         self.w_both_push_extra = 2.0  # extra penalty if both push when close
+        self.w_r1_yield_bias = 2.5    # extra penalty for r1 pushing when too close
 
         self.timer = self.create_timer(1.0 / self.tick_hz, self.tick)
         self.get_logger().info("Goal-based NashController started.")
@@ -127,6 +142,10 @@ class NashController(Node):
                 r1 -= self.w_both_push_extra
                 r2 -= self.w_both_push_extra
 
+            # Preference: when very close, discourage r1 from pushing
+            if dist < self.collision_dist and a1 == self.PUSH:
+                r1 -= self.w_r1_yield_bias
+
             return r1, r2
 
         A = [[0.0, 0.0], [0.0, 0.0]]
@@ -177,18 +196,42 @@ class NashController(Node):
             return prefer
         return eq_list[0]
 
-    def publish_action(self, pub, action: int):
+    def publish_action(self, pub, action: int, x: float, y: float, yaw: float, goal):
+        """
+        If action is PUSH: drive toward goal with simple steering controller.
+        If action is yield: stop.
+        """
         msg = Twist()
-        msg.linear.x = self.v_push if action == self.PUSH else self.v_yield
-        msg.angular.z = 0.0
+
+        if action == self.YIELD:
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            pub.publish(msg)
+            return
+
+        # Desired goal
+        gx, gy = goal
+        desired = math.atan2(gy - y, gx - x)
+        err = wrap_to_pi(desired - yaw)
+
+        # Angular control (P controlle)
+        w = clamp(self.k_yaw * err, -self.max_w, self.max_w)
+
+        # Reduce forward speed if facing away
+        v = self.v_push
+        if abs(err) > self.turn_in_place_yaw:
+            v = 0.1 * self.v_push #mostly rotate
+            
+        msg.linear.x = v
+        msg.angular.z = w
         pub.publish(msg)
 
     def tick(self):
         if self.r1_odom is None or self.r2_odom is None:
             return
 
-        x1, y1, _ = self.get_xy_yaw(self.r1_odom)
-        x2, y2, _ = self.get_xy_yaw(self.r2_odom)
+        x1, y1, yaw1 = self.get_xy_yaw(self.r1_odom)
+        x2, y2, yaw2= self.get_xy_yaw(self.r2_odom)
         dist = math.hypot(x1 - x2, y1 - y2)
 
         d1_goal = self.dist_to_goal(x1, y1, self.r1_goal)
@@ -199,8 +242,8 @@ class NashController(Node):
         r2_done = d2_goal < 0.25
 
         if r1_done and r2_done:
-            self.publish_action(self.pub_r1, self.YIELD)
-            self.publish_action(self.pub_r2, self.YIELD)
+            self.publish_action(self.pub_r1, self.YIELD, x1, y1, yaw1, self.r1_goal)
+            self.publish_action(self.pub_r2, self.YIELD, x2, y2, yaw2, self.r2_goal)
             self.get_logger().info("Both goals reached. Stopping.")
             return
 
@@ -218,8 +261,8 @@ class NashController(Node):
         if r2_done:
             a2 = self.YIELD
 
-        self.publish_action(self.pub_r1, a1)
-        self.publish_action(self.pub_r2, a2)
+        self.publish_action(self.pub_r1, a1, x1, y1, yaw1, self.r1_goal)
+        self.publish_action(self.pub_r2, a2, x2, y2, yaw2, self.r2_goal)
 
         name = {0: "PUSH", 1: "YIELD"}
         self.get_logger().info(
@@ -227,8 +270,7 @@ class NashController(Node):
             f"eq={eq} chosen=({name[a1]},{name[a2]}) | "
             f"A={[[round(x,2) for x in row] for row in A]} B={[[round(x,2) for x in row] for row in B]}"
         )
-
-
+        
 def main():
     rclpy.init()
     node = NashController()
